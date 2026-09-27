@@ -41,6 +41,15 @@ case "$MODE:$p80" in
   docker:nginx | native:docker-proxy) echo "port 80 is held by $p80; refusing '$MODE' on the same server"; exit 1 ;;
 esac
 
+apt_get() { # waits out Ubuntu's own apt runs (unattended-upgrades starts in a new VM's first hour) instead of failing on the lock
+  local i
+  for i in $(seq 120); do
+    fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1 || break
+    [ "$i" = 1 ] && echo "waiting for another apt run to finish (unattended-upgrades?)…"
+    sleep 5
+  done
+  command apt-get -o DPkg::Lock::Timeout=600 "$@"
+}
 apt_key() { # apt_key <name> <url> <fingerprint> — fetch a repo key and check it before trusting it
   local tmp; tmp="$(mktemp)"
   curl -fsSL "$2" -o "$tmp"
@@ -56,9 +65,9 @@ fetch_checked() { # fetch_checked <url> <sha256> <dest>
 
 # --- common ---------------------------------------------------------------------------------------
 echo "==> system updates + base tools"
-apt-get update -y
-apt-get -y -o Dpkg::Options::=--force-confold upgrade
-apt-get install -y ca-certificates curl gnupg git jq
+apt_get update -y
+apt_get -y -o Dpkg::Options::=--force-confold upgrade
+apt_get install -y ca-certificates curl gnupg git jq
 install -m 0755 -d /etc/apt/keyrings
 
 echo "==> 4G swap + kernel settings (Redis wants overcommit)"
@@ -96,8 +105,8 @@ docker_engine() {
   chmod a+r /etc/apt/keyrings/docker.asc
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
     > /etc/apt/sources.list.d/docker.list
-  apt-get update -y
-  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  apt_get update -y
+  apt_get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   # Container logs rotate (small disk); containers survive a dockerd restart.
   mkdir -p /etc/docker
   local want='{
@@ -116,7 +125,7 @@ docker_engine() {
 # --- native ---------------------------------------------------------------------------------------
 native_engine() {
   echo "==> build tools, nginx, supervisor, redis, certbot, PDF libraries"
-  apt-get install -y build-essential pkg-config libmariadb-dev cron \
+  apt_get install -y build-essential pkg-config libmariadb-dev cron \
     nginx supervisor redis-server fail2ban certbot python3-certbot-nginx \
     xvfb libfontconfig1 fontconfig libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b
 
@@ -128,8 +137,8 @@ native_engine() {
   apt_key nodesource https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key "$NODESOURCE_KEY_FPR"
   echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" \
     > /etc/apt/sources.list.d/nodesource.list
-  apt-get update -y
-  apt-get install -y mariadb-server mariadb-client nodejs
+  apt_get update -y
+  apt_get install -y mariadb-server mariadb-client nodejs
   command -v yarn >/dev/null || npm install -g yarn@1 >/dev/null
 
   local cnf=/etc/mysql/mariadb.conf.d/99-frappe.cnf want_cnf
@@ -151,7 +160,7 @@ default-character-set = utf8mb4'
   if ! wkhtmltopdf --version 2>/dev/null | grep -q 'with patched qt'; then
     fetch_checked "https://github.com/wkhtmltopdf/packaging/releases/download/$WKHTMLTOX_VERSION/wkhtmltox_$WKHTMLTOX_VERSION.jammy_amd64.deb" \
       "$WKHTMLTOX_SHA256" /tmp/wkhtmltox.deb
-    apt-get install -y /tmp/wkhtmltox.deb
+    apt_get install -y /tmp/wkhtmltox.deb
     rm -f /tmp/wkhtmltox.deb
   fi
 
