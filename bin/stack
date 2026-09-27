@@ -80,8 +80,10 @@ cmd_up() {
 
 cmd_init() {
   local email="${1:-}" line s=""
+  [ "$(cat /etc/frappe-stack-mode 2>/dev/null || echo docker)" = docker ] ||
+    die "this server is set up for native mode — use bin/native (see NATIVE.md)"
   docker info >/dev/null 2>&1 ||
-    die "docker isn't usable by $(id -un) — run: sudo bash $ROOT/bootstrap/host-prep.sh, then log out and in"
+    die "docker isn't usable by $(id -un) — run: sudo bash $ROOT/bootstrap/host-prep.sh docker, then log out and in"
   mkdir -p "$ROOT"/{env,compose,benches,logs}
   chmod 700 "$ROOT/env" "$ROOT/compose"
   [ -d "$FD/.git" ] || git clone -q "$FRAPPE_DOCKER_URL" "$FD"

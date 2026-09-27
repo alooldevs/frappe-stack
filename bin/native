@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# native — several Frappe benches on one host the classic way: bench + nginx + supervisor, no Docker.
+#
+#   native init [letsencrypt-email]                  MariaDB admin login for new sites, nightly backup cron
+#   native new-bench <bench> [frappe-url] [branch]   bench init in /srv/benches/<bench>, wired into nginx + supervisor
+#   native bench <bench> <args...>                   run bench inside that bench (get-app, migrate, update, …)
+#   native site <bench> <domain> [app ...]           create a site (or re-check one) and serve it over HTTPS
+#   native apply <bench>                             regenerate the bench's nginx + supervisor config and reload
+#   native restart <bench>                           restart the bench's web and worker processes
+#   native backup                                    bench --site all backup --with-files, every bench
+#   native ps                                        supervisor status, all benches
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+BENCHES=/srv/benches # one parent for all benches: bench only avoids port clashes between siblings
+ENVF="$ROOT/env/native.env"
+PYTHON_VERSION="${NATIVE_PYTHON:-3.14}" # pin it: a bare "python3" lets uv pick the newest managed Python
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+
+usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+die() { echo "native: $*" >&2; exit 1; }
+valid_bench() { [[ "$1" =~ ^[a-z][a-z0-9]{0,15}$ ]]; }
+valid_domain() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; }
+get_env() { [ -f "$1" ] || return 0; sed -n "s/^$2=//p" "$1" | tail -1; }
+set_env() { # set_env <file> <KEY> <value>
+  local f="$1"
+  ( umask 077; touch "$f" )
+  K="$2" V="$3" awk 'index($0, ENVIRON["K"] "=") == 1 { print ENVIRON["K"] "=" ENVIRON["V"]; done = 1; next }
+    { print } END { if (!done) print ENVIRON["K"] "=" ENVIRON["V"] }' "$f" > "$f.tmp"
+  mv "$f.tmp" "$f"; chmod 600 "$f"
+}
+bench_dir() { valid_bench "$1" || die "bench name: lowercase letters and digits, starting with a letter"; echo "$BENCHES/$1"; }
+in_bench() { local d; d="$(bench_dir "$1")"; [ -d "$d/sites" ] || die "no bench $1 in $BENCHES"; ( cd "$d" && bench "${@:2}" ); }
+
+# --- init -------------------------------------------------------------------------------------
+
+cmd_init() {
+  local email="${1:-}" pw line
+  [ "$(cat /etc/frappe-stack-mode 2>/dev/null)" = native ] || die "run first: sudo bash $ROOT/bootstrap/host-prep.sh native"
+  command -v bench >/dev/null || die "bench isn't on PATH — log out and back in after host-prep"
+  mkdir -p "$ROOT/env" "$ROOT/logs"; chmod 700 "$ROOT/env"
+  [ -n "$email" ] && set_env "$ENVF" EMAIL "$email"
+  [ -n "$(get_env "$ENVF" EMAIL)" ] || die "first run needs the Let's Encrypt email: native init you@example.org"
+
+  # Ubuntu's MariaDB root logs in by unix socket only, so new sites use a dedicated admin login.
+  if [ -z "$(get_env "$ENVF" DB_ADMIN_PASSWORD)" ]; then
+    set_env "$ENVF" DB_ADMIN_USER stack_admin
+    set_env "$ENVF" DB_ADMIN_PASSWORD "$(openssl rand -hex 16)"
+  fi
+  pw="$(get_env "$ENVF" DB_ADMIN_PASSWORD)"
+  sudo mariadb <<SQL
+CREATE USER IF NOT EXISTS 'stack_admin'@'localhost' IDENTIFIED BY '$pw';
+ALTER USER 'stack_admin'@'localhost' IDENTIFIED BY '$pw';
+GRANT ALL PRIVILEGES ON *.* TO 'stack_admin'@'localhost' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+SQL
+  MYSQL_PWD="$pw" mariadb -ustack_admin -Nse 'select 1' >/dev/null || die "MariaDB admin login doesn't work"
+
+  line="0 2 * * * $ROOT/bin/native backup >> $ROOT/logs/backup.log 2>&1"
+  { { crontab -l 2>/dev/null || true; } | { grep -vF "bin/native backup" || true; }; echo "$line"; } | crontab -
+  echo "Ready: MariaDB $(MYSQL_PWD="$pw" mariadb -ustack_admin -Nse 'select version()'), nightly backup at 02:00 UTC."
+  echo "Next: native new-bench <bench> [frappe-url] [branch]"
+}
+
+# --- new-bench / apply ----------------------------------------------------------------------
+
+cmd_new_bench() {
+  local b="${1:-}" url="${2:-https://github.com/frappe/frappe}" branch="${3:-version-16}" d
+  d="$(bench_dir "$b")"
+  [ -e "$d" ] && die "bench $b already exists ($d)"
+  [ -d "$BENCHES" ] && [ -w "$BENCHES" ] || die "$BENCHES missing or not writable — run host-prep native"
+  echo "bench init $b: frappe $url@$branch, python $PYTHON_VERSION (a few minutes)"
+  ( cd "$BENCHES" && bench init --python "$PYTHON_VERSION" --frappe-path "$url" --frappe-branch "$branch" "$b" )
+  in_bench "$b" config dns_multitenant on
+  in_bench "$b" config restart_supervisor_on_update on
+  cmd_apply "$b"
+  cat <<EOF
+Bench $b is running (no sites yet). Next:
+  native bench $b get-app <repo-url> --branch <branch>     for each app
+  native site $b <domain> <app> [<app> …]
+EOF
+}
+
+cmd_apply() {
+  local b="${1:-}" d
+  d="$(bench_dir "$b")"; [ -d "$d/sites" ] || die "no bench $b in $BENCHES"
+  # Not `bench setup production`: on 24.04 it tries to pip-install ansible into bench's uv tool env and
+  # skips the supervisor link on first run. These are the same steps, done directly.
+  in_bench "$b" setup supervisor --yes
+  in_bench "$b" setup nginx --yes --logging none # --logging default needs a log_format "main" stock nginx lacks
+  sudo ln -sfn "$d/config/supervisor.conf" "/etc/supervisor/conf.d/$b.conf"
+  sudo ln -sfn "$d/config/nginx.conf" "/etc/nginx/conf.d/$b.conf"
+  sudo supervisorctl reread >/dev/null
+  sudo supervisorctl update
+  sudo nginx -t -q
+  sudo systemctl reload nginx
+  sleep 1 # reload returns before the new workers serve; the next step should see the new config
+}
+
+# --- site ---------------------------------------------------------------------------------------
+
+cmd_site() {
+  local b="${1:-}" s="${2:-}" d pwf apw email app args=() live
+  valid_bench "$b" && valid_domain "$s" || die "usage: native site <bench> <domain> [app ...]"
+  shift 2
+  d="$(bench_dir "$b")"; [ -d "$d/sites" ] || die "no bench $b — native new-bench $b"
+  email="$(get_env "$ENVF" EMAIL)"; [ -n "$email" ] || die "run: native init you@example.org"
+  pwf="$ROOT/env/$b.passwords"
+
+  if [ -d "$d/sites/$s" ]; then
+    echo "site $s exists — checking scheduler, host_name, certificate and nginx"
+  else
+    ( umask 077; touch "$pwf" )
+    grep -q "^$s " "$pwf" || echo "$s Administrator $(openssl rand -hex 10)" >> "$pwf"
+    apw="$(awk -v s="$s" '$1 == s { print $3 }' "$pwf")"
+    for app in "$@"; do args+=(--install-app "$app"); done
+    in_bench "$b" new-site "$s" --db-root-username "$(get_env "$ENVF" DB_ADMIN_USER)" \
+      --db-root-password "$(get_env "$ENVF" DB_ADMIN_PASSWORD)" --admin-password "$apw" "${args[@]}" 2>&1 |
+      tr '\r' '\n' | { grep -vE 'Updating DocTypes|^\s*$' || true; }
+  fi
+  in_bench "$b" --site "$s" enable-scheduler
+  in_bench "$b" --site "$s" set-config host_name "https://$s"
+
+  live="/etc/letsencrypt/live/$s"
+  if ! sudo test -f "$live/fullchain.pem"; then
+    cmd_apply "$b" # nginx must answer for $s on :80 before certbot can prove the domain
+    sudo certbot certonly --nginx -d "$s" -m "$email" --agree-tos -n --deploy-hook "systemctl reload nginx" ||
+      die "no certificate for $s. Does DNS point here? (dig +short $s)"
+  fi
+  in_bench "$b" --site "$s" set-config ssl_certificate "$live/fullchain.pem"
+  in_bench "$b" --site "$s" set-config ssl_certificate_key "$live/privkey.pem"
+  cmd_apply "$b"
+
+  printf 'waiting for https://%s ' "$s"
+  for _ in $(seq 12); do
+    if [ "$(curl -s -m 10 --resolve "$s:443:127.0.0.1" -o /dev/null -w '%{http_code}' "https://$s/api/method/ping")" = 200 ]; then
+      echo "— OK"
+      echo "Log in at https://$s as Administrator. Password: grep '^$s ' $pwf"
+      return 0
+    fi
+    printf '.'; sleep 5
+  done
+  echo; die "https://$s isn't answering. Check: native ps, sudo nginx -t, $d/logs/"
+}
+
+# --- dispatch -----------------------------------------------------------------------------------
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  init)      cmd_init "$@" ;;
+  new-bench) cmd_new_bench "$@" ;;
+  bench)     [ -n "${1:-}" ] || usage; in_bench "$@" ;;
+  site)      cmd_site "$@" ;;
+  apply)     cmd_apply "$@" ;;
+  restart)   [ -n "${1:-}" ] || usage; bench_dir "$1" >/dev/null; supervisorctl restart "$1-web:*" "$1-workers:*" ;;
+  backup)
+    rc=0
+    for d in "$BENCHES"/*/; do
+      [ -d "$d/sites" ] || continue
+      echo "== $(date -u +%FT%TZ) $(basename "$d")"
+      ( cd "$d" && bench --site all backup --with-files ) || rc=1
+    done
+    exit "$rc" ;;
+  ps) supervisorctl status ;;
+  *) usage ;;
+esac
