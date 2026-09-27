@@ -60,10 +60,20 @@ render() {
 }
 compose_of() { docker compose --project-name "$1" -f "$ROOT/compose/$1.yaml" "${@:2}"; }
 cmd_up() {
-  case "$1" in traefik | mariadb) ;; *)
-    [ -n "$(get_env "$ROOT/env/$1.env" CUSTOM_TAG)" ] || die "bench $1 has no image yet — stack build $1" ;;
-  esac
+  local before after
+  case "$1" in traefik | mariadb) render "$1"; compose_of "$1" up -d --remove-orphans "${@:2}"; return ;; esac
+  [ -n "$(get_env "$ROOT/env/$1.env" CUSTOM_TAG)" ] || die "bench $1 has no image yet — stack build $1"
+  before="$(docker inspect -f '{{.Config.Image}}' "$1-backend-1" 2>/dev/null || true)"
   render "$1"; compose_of "$1" up -d --remove-orphans "${@:2}"
+  after="$(docker inspect -f '{{.Config.Image}}' "$1-backend-1" 2>/dev/null || true)"
+  if [ -n "$before" ] && [ "$before" != "$after" ]; then
+    # A new image has new asset filenames. Frappe caches the asset map bench-wide in Redis ("assets_json"),
+    # only `bench build` refreshes it, and redis-cache survives restarts, so pages would keep asking for the
+    # old CSS (404, unstyled UI). Drop it and restart the backend so it re-reads the image's assets.json.
+    echo "new image ($before → $after): clearing cached asset map"
+    compose_of "$1" exec -T redis-cache redis-cli del assets_json >/dev/null
+    compose_of "$1" restart backend
+  fi
 }
 
 # --- init: shared services --------------------------------------------------------------------

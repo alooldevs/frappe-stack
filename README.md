@@ -127,14 +127,20 @@ image, so every change goes through `stack build`.
 
 ## Good to know
 
-- **CPU credits.** B-series VMs sustain 40% of their CPU and burst on banked credits. Builds use them up.
-  Check *CPU Credits Remaining* in the Azure portal before several builds in a row.
+- **Builds are heavy for this VM.** B-series VMs sustain 40% of their CPU and burst on banked credits, and
+  builds use them up. Check *CPU Credits Remaining* in the Azure portal before several builds in a row.
+  Saving the 3 GB image also maxes out a 64 GiB disk for about a minute; the sites slow down and SSH can
+  drop. Run builds inside `tmux` so a dropped connection doesn't kill them.
 - **Memory** (measured): a bench idles at about 370 MB, MariaDB at about 410 MB, Traefik at about 25 MB.
   CPU runs out before RAM does.
 - **Docker ignores ufw.** The Azure network security group (NSG) is the firewall. Only Traefik publishes
   ports.
 - **Backups stay on this disk.** They protect against app mistakes, not against losing the VM. Copy them
   off-site yourself.
+- **Unstyled UI after an update** (CSS 404s, JS fine) means the bench-wide asset map cached in Redis
+  (`assets_json`) is from the previous image. `stack up` clears it when the image changes. To clear it by hand:
+  `docker compose -p alpha -f ~/stack/compose/alpha.yaml exec redis-cache redis-cli del assets_json && stack restart alpha backend`.
+  `bench clear-cache` doesn't touch this key.
 - **Disk after updates.** The previous bench image stays behind (about 3 GB). List them with
   `docker image ls 'stack/*'` and remove old tags with `docker image rm stack/alpha:<old-tag>`.
   The build cache grows too: check it with `docker buildx du` and trim it with
