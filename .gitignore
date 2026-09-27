@@ -1,0 +1,8 @@
+# Per-server state and secrets. The repo holds the machine, never the material.
+env/
+compose/
+benches/
+frappe_docker/
+logs/
+overrides/
+bootstrap/*.log

@@ -1,0 +1,5 @@
+# Additions to frappe_docker's overrides/compose.mariadb-shared.yaml.
+services:
+  database:
+    volumes:
+      - ${STACK_ROOT:?run through bin/stack}/base/mariadb.cnf:/etc/mysql/conf.d/zz-stack.cnf:ro

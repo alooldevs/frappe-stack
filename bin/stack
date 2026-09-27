@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# stack — several Frappe benches on one Docker host (frappe_docker's single-server layout).
+#
+#   stack init [letsencrypt-email]         shared MariaDB + Traefik, nightly backup cron
+#   stack new-bench <bench> <domain>        scaffold benches/<bench>/ and env/<bench>.env
+#   stack build <bench>                     build the bench image, apps baked in
+#   stack up <bench|mariadb|traefik>        render compose/<name>.yaml and apply it
+#   stack site <bench> <domain> [app ...]   create a site (or re-check one) and route it over HTTPS
+#   stack bench <bench> <args...>           run a bench command in the bench's backend
+#   stack sh <bench>                        shell in the bench's backend
+#   stack logs <name> [service]             follow logs
+#   stack down <name>                       stop a stack, volumes kept
+#   stack backup                            bench --site all backup --with-files, every running bench
+#   stack ps                                what's running
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+FD="$ROOT/frappe_docker"
+FRAPPE_DOCKER_URL=https://github.com/frappe/frappe_docker.git
+FRAPPE_DOCKER_REF=3d0a0e5 # tested 2026-09-27; `stack build` checks its Containerfile patch against this
+export STACK_ROOT="$ROOT"  # used by base/mariadb.yaml
+
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+die() { echo "stack: $*" >&2; exit 1; }
+valid_bench() { [[ "$1" =~ ^[a-z][a-z0-9]{0,15}$ ]] && [ "$1" != traefik ] && [ "$1" != mariadb ]; }
+valid_domain() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; }
+
+get_env() { [ -f "$1" ] || return 0; sed -n "s/^$2=//p" "$1" | tail -1; }
+set_env() { # set_env <file> <KEY> <value> — value may hold backticks and pipes
+  local f="$1"
+  ( umask 077; touch "$f" )
+  K="$2" V="$3" awk 'index($0, ENVIRON["K"] "=") == 1 { print ENVIRON["K"] "=" ENVIRON["V"]; done = 1; next }
+    { print } END { if (!done) print ENVIRON["K"] "=" ENVIRON["V"] }' "$f" > "$f.tmp"
+  mv "$f.tmp" "$f"; chmod 600 "$f"
+}
+
+# --- compose ----------------------------------------------------------------------------------
+
+files_for() {
+  local n="$1" f
+  case "$n" in
+    traefik) f=("$ROOT/base/traefik.yaml") ;;
+    mariadb) f=("$FD/overrides/compose.mariadb-shared.yaml" "$ROOT/base/mariadb.yaml") ;;
+    *) f=("$FD/compose.yaml" "$FD/overrides/compose.redis.yaml"
+          "$FD/overrides/compose.multi-bench.yaml" "$FD/overrides/compose.multi-bench-ssl.yaml") ;;
+  esac
+  [ -f "$ROOT/overrides/$n.yaml" ] && f+=("$ROOT/overrides/$n.yaml") # optional per-server tweak
+  printf -- '-f\n%s\n' "${f[@]}"
+}
+
+render() {
+  local n="$1"
+  [ -f "$ROOT/env/$n.env" ] || die "missing env/$n.env"
+  [ -d "$FD" ] || die "frappe_docker missing — run: stack init"
+  mapfile -t F < <(files_for "$n")
+  ( umask 077
+    docker compose --project-name "$n" --env-file "$ROOT/env/$n.env" "${F[@]}" config > "$ROOT/compose/$n.yaml.tmp" )
+  mv "$ROOT/compose/$n.yaml.tmp" "$ROOT/compose/$n.yaml"
+}
+compose_of() { docker compose --project-name "$1" -f "$ROOT/compose/$1.yaml" "${@:2}"; }
+cmd_up() {
+  case "$1" in traefik | mariadb) ;; *)
+    [ -n "$(get_env "$ROOT/env/$1.env" CUSTOM_TAG)" ] || die "bench $1 has no image yet — stack build $1" ;;
+  esac
+  render "$1"; compose_of "$1" up -d --remove-orphans "${@:2}"
+}
+
+# --- init: shared services --------------------------------------------------------------------
+
+cmd_init() {
+  local email="${1:-}" line s=""
+  docker info >/dev/null 2>&1 ||
+    die "docker isn't usable by $(id -un) — run: sudo bash $ROOT/bootstrap/host-prep.sh, then log out and in"
+  mkdir -p "$ROOT"/{env,compose,benches,logs}
+  chmod 700 "$ROOT/env" "$ROOT/compose"
+  [ -d "$FD/.git" ] || git clone -q "$FRAPPE_DOCKER_URL" "$FD"
+  git -C "$FD" cat-file -e "$FRAPPE_DOCKER_REF^{commit}" 2>/dev/null || git -C "$FD" fetch -q origin
+  git -C "$FD" checkout -q "$FRAPPE_DOCKER_REF"
+  echo "frappe_docker @ $FRAPPE_DOCKER_REF"
+
+  [ -f "$ROOT/env/mariadb.env" ] || ( umask 077; echo "DB_PASSWORD=$(openssl rand -hex 16)" > "$ROOT/env/mariadb.env" )
+  [ -n "$email" ] && set_env "$ROOT/env/traefik.env" EMAIL "$email"
+  [ -n "$(get_env "$ROOT/env/traefik.env" EMAIL)" ] || die "first run needs the Let's Encrypt email: stack init you@example.org"
+
+  cmd_up mariadb
+  for _ in $(seq 60); do
+    s="$(docker inspect -f '{{.State.Health.Status}}' mariadb-database 2>/dev/null || true)"
+    [ "$s" = healthy ] && break; sleep 2
+  done
+  [ "$s" = healthy ] || die "mariadb not healthy — stack logs mariadb"
+  cmd_up traefik
+
+  line="0 2 * * * $ROOT/bin/stack backup >> $ROOT/logs/backup.log 2>&1"
+  { { crontab -l 2>/dev/null || true; } | { grep -vF "bin/stack backup" || true; }; echo "$line"; } | crontab -
+  echo "Shared services up; nightly backup at 02:00 UTC. Next: stack new-bench <bench> <domain>"
+}
+
+# --- new-bench --------------------------------------------------------------------------------
+
+cmd_new_bench() {
+  local b="${1:-}" d="${2:-}"
+  valid_bench "$b" || die "bench name: lowercase letters and digits, starting with a letter (alpha, beta, …)"
+  valid_domain "$d" || die "usage: stack new-bench <bench> <first-site-domain>"
+  if [ -e "$ROOT/benches/$b" ] || [ -e "$ROOT/env/$b.env" ]; then die "bench $b already exists"; fi
+  mkdir -p "$ROOT/benches/$b"
+  cp "$ROOT/templates/build.env" "$ROOT/templates/apps.json" "$ROOT/benches/$b/"
+  ( umask 077
+    printf '%s\n' "DB_HOST=mariadb-database" "DB_PORT=3306" "ROUTER=$b" \
+      "SITES_RULE=Host(\`$d\`)" "GUNICORN_WORKERS=2" > "$ROOT/env/$b.env" )
+  cat <<EOF
+Bench $b scaffolded. Next:
+  1. edit $ROOT/benches/$b/build.env    which Frappe (repo, branch)
+  2. edit $ROOT/benches/$b/apps.json    which apps
+  3. stack build $b && stack up $b && stack site $b $d <app> [<app> …]
+EOF
+}
+
+# --- build ------------------------------------------------------------------------------------
+# Uses frappe_docker's images/custom/Containerfile, patched on the fly. Private repos go over SSH with
+# keyup aliases (git@github-ACCOUNT:OWNER/REPO.git): the aliases a bench uses, their keys and github.com's
+# host key are handed to the builder stage as one BuildKit secret and deleted in the same RUN, so keys
+# never reach build args, image layers, or the final image (the builder stage isn't shipped).
+
+cmd_build() {
+  local b="${1:-}"
+  valid_bench "$b" || die "usage: stack build <bench>"
+  local BD="$ROOT/benches/$b"
+  [ -f "$BD/build.env" ] || die "missing $BD/build.env — stack new-bench $b <domain>"
+  [ -f "$BD/apps.json" ] || echo '[]' > "$BD/apps.json"
+  jq -e 'type=="array"' "$BD/apps.json" >/dev/null || die "$BD/apps.json must be a JSON array"
+  if grep -Eq 'https?://[^/@]+@' "$BD/apps.json" "$BD/build.env"; then die "credentials in a URL — use a keyup SSH alias instead"; fi
+  local FRAPPE_PATH FRAPPE_BRANCH PYTHON_VERSION NODE_VERSION
+  FRAPPE_PATH="$(get_env "$BD/build.env" FRAPPE_PATH)"
+  FRAPPE_BRANCH="$(get_env "$BD/build.env" FRAPPE_BRANCH)"
+  PYTHON_VERSION="$(get_env "$BD/build.env" PYTHON_VERSION)"; PYTHON_VERSION="${PYTHON_VERSION:-3.14}"
+  NODE_VERSION="$(get_env "$BD/build.env" NODE_VERSION)"; NODE_VERSION="${NODE_VERSION:-24}"
+  [ -n "$FRAPPE_PATH" ] && [ -n "$FRAPPE_BRANCH" ] || die "set FRAPPE_PATH and FRAPPE_BRANCH in $BD/build.env"
+
+  # patch: ssh client in the builder, ssh bundle in, ssh bundle out
+  local CF="$BD/Containerfile" UP="$FD/images/custom/Containerfile" a
+  local run_anchor='RUN --mount=type=secret,id=apps_json,target=/opt/frappe/apps.json,uid=1000,gid=1000 \'
+  local end_anchor='  find apps -mindepth 1 -path "*/.git" | xargs rm -fr'
+  local pkg_anchor='    wget \' # builder apt list; git there has no ssh client (--no-install-recommends)
+  for a in "$run_anchor" "$end_anchor" "$pkg_anchor"; do
+    [ "$(grep -cxF -- "$a" "$UP")" = 1 ] || die "upstream Containerfile changed shape; anchor not found: $a"
+  done
+  RA="$run_anchor" EA="$end_anchor" PA="$pkg_anchor" awk '
+    $0 == ENVIRON["PA"] { print; print "    openssh-client \\"; next }
+    $0 == ENVIRON["RA"] {
+      print
+      print "  --mount=type=secret,id=ssh_bundle,target=/run/secrets/ssh_bundle,uid=1000,gid=1000,required=false \\"
+      print "  if [ -s /run/secrets/ssh_bundle ]; then mkdir -p ~/.ssh && tar -xzf /run/secrets/ssh_bundle -C ~/.ssh && chmod 700 ~/.ssh && chmod 600 ~/.ssh/*; fi && \\"
+      next }
+    $0 == ENVIRON["EA"] { print $0 " && \\"; print "  rm -rf /home/frappe/.ssh"; next }
+    { print }' "$UP" > "$CF"
+  [ "$(grep -c 'ssh_bundle\|rm -rf /home/frappe/.ssh\|openssh-client' "$CF")" -ge 4 ] || die "Containerfile patch did not apply"
+
+  # ssh bundle for the github-* aliases this bench uses
+  local h block keyfile
+  # WORK is global: the EXIT trap runs after this function has returned
+  WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT; chmod 700 "$WORK"; mkdir "$WORK/ssh"
+  mapfile -t ALIASES < <( { echo "$FRAPPE_PATH"; jq -r '.[].url' "$BD/apps.json"; } |
+    sed -n 's/^git@\(github-[A-Za-z0-9._-]*\):.*/\1/p' | sort -u )
+  local SECRETS=()
+  if [ "${#ALIASES[@]}" -gt 0 ]; then
+    for h in "${ALIASES[@]}"; do
+      block="$(awk -v h="Host $h" '$0 == h { p = 1; print; next } p && /^Host / { exit } p && NF { print }' "$HOME/.ssh/config" 2>/dev/null)"
+      [ -n "$block" ] || die "no '$h' in ~/.ssh/config — run keyup for that GitHub account on this server"
+      keyfile="$(printf '%s\n' "$block" | awk '$1 == "IdentityFile" { print $2 }' | sed "s|^~|$HOME|")"
+      [ -f "$keyfile" ] || die "key for $h missing: $keyfile"
+      cp "$keyfile" "$WORK/ssh/"
+      printf '%s\n\n' "$block" | sed "s|IdentityFile .*/|IdentityFile ~/.ssh/|" >> "$WORK/ssh/config"
+    done
+    { ssh-keygen -F github.com -f "$HOME/.ssh/known_hosts" 2>/dev/null || true; } | { grep -v '^#' || true; } > "$WORK/ssh/known_hosts"
+    [ -s "$WORK/ssh/known_hosts" ] || die "github.com not in ~/.ssh/known_hosts — run: ssh -T git@${ALIASES[0]}"
+    tar -czf "$WORK/ssh_bundle.tgz" -C "$WORK/ssh" .
+    SECRETS=(--secret "id=ssh_bundle,src=$WORK/ssh_bundle.tgz")
+  fi
+
+  local TAG IMAGE LOG ENVF kv k
+  TAG="$(date -u +%Y%m%d-%H%M)"; IMAGE="stack/$b"; LOG="$BD/build-$TAG.log"
+  echo "building $IMAGE:$TAG  (frappe $FRAPPE_PATH@$FRAPPE_BRANCH, python $PYTHON_VERSION, node $NODE_VERSION)"
+  echo "log: $LOG"
+  docker build \
+    --build-arg FRAPPE_PATH="$FRAPPE_PATH" --build-arg FRAPPE_BRANCH="$FRAPPE_BRANCH" \
+    --build-arg PYTHON_VERSION="$PYTHON_VERSION" --build-arg NODE_VERSION="$NODE_VERSION" \
+    --build-arg CACHE_BUST="$TAG" \
+    --secret "id=apps_json,src=$BD/apps.json" "${SECRETS[@]}" \
+    --progress=plain -t "$IMAGE:$TAG" -f "$CF" "$FD" > "$LOG" 2>&1 ||
+    { echo "BUILD FAILED — last lines of $LOG:"; tail -40 "$LOG"; exit 1; }
+
+  ENVF="$ROOT/env/$b.env"
+  for kv in "CUSTOM_IMAGE=$IMAGE" "CUSTOM_TAG=$TAG" "PULL_POLICY=never"; do
+    k="${kv%%=*}"; set_env "$ENVF" "$k" "${kv#*=}"
+  done
+  docker image ls "$IMAGE:$TAG" --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
+  echo "BUILD OK — env/$b.env points at $IMAGE:$TAG. Next: stack up $b"
+}
+
+# --- site -------------------------------------------------------------------------------------
+
+cmd_site() {
+  local b="${1:-}" d="${2:-}"
+  valid_bench "$b" && valid_domain "$d" || die "usage: stack site <bench> <domain> [app ...]"
+  shift 2
+  [ -f "$ROOT/compose/$b.yaml" ] && [ -n "$(compose_of "$b" ps -q backend 2>/dev/null)" ] ||
+    die "bench $b isn't running — stack build $b && stack up $b"
+  local pwf="$ROOT/env/$b.passwords" pw root rule app args=()
+
+  if compose_of "$b" exec -T backend test -d "sites/$d"; then
+    echo "site $d exists — checking scheduler, host_name and route"
+  else
+    ( umask 077; touch "$pwf" )
+    grep -q "^$d " "$pwf" || echo "$d Administrator $(openssl rand -hex 10)" >> "$pwf"
+    pw="$(awk -v d="$d" '$1 == d { print $3 }' "$pwf")"
+    root="$(get_env "$ROOT/env/mariadb.env" DB_PASSWORD)"
+    for app in "$@"; do args+=(--install-app "$app"); done
+    compose_of "$b" exec -T backend bench new-site --mariadb-user-host-login-scope=% \
+      --db-root-password "$root" --admin-password "$pw" "${args[@]}" "$d" 2>&1 |
+      tr '\r' '\n' | { grep -vE 'Updating DocTypes|^\s*$' || true; }
+  fi
+  compose_of "$b" exec -T backend bench --site "$d" enable-scheduler
+  compose_of "$b" exec -T backend bench --site "$d" set-config host_name "https://$d"
+
+  rule="$(get_env "$ROOT/env/$b.env" SITES_RULE)"
+  if [[ "$rule" != *"Host(\`$d\`)"* ]]; then
+    set_env "$ROOT/env/$b.env" SITES_RULE "${rule:+$rule || }Host(\`$d\`)"
+    cmd_up "$b"
+  fi
+
+  printf 'waiting for https://%s ' "$d"
+  for _ in $(seq 30); do
+    if [ "$(curl -s -m 10 --resolve "$d:443:127.0.0.1" -o /dev/null -w '%{http_code}' "https://$d/api/method/ping")" = 200 ]; then
+      echo "— OK"
+      echo "Log in at https://$d as Administrator. Password: grep '^$d ' $pwf"
+      return 0
+    fi
+    printf '.'; sleep 10
+  done
+  echo
+  die "https://$d isn't answering with a valid certificate yet. Does DNS point here? (dig +short $d)  Traefik: stack logs traefik"
+}
+
+# --- dispatch ---------------------------------------------------------------------------------
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  init)      cmd_init "$@" ;;
+  new-bench) cmd_new_bench "$@" ;;
+  build)     cmd_build "$@" ;;
+  up)        [ -n "${1:-}" ] || usage; cmd_up "$@" ;;
+  site)      cmd_site "$@" ;;
+  bench)     [ -n "${1:-}" ] || usage; compose_of "$1" exec backend bench "${@:2}" ;;
+  sh)        [ -n "${1:-}" ] || usage; compose_of "$1" exec backend bash ;;
+  logs)      [ -n "${1:-}" ] || usage; compose_of "$1" logs -f --tail=100 "${@:2}" ;;
+  down)      [ -n "${1:-}" ] || usage; compose_of "$1" down "${@:2}" ;;
+  backup)
+    rc=0
+    for p in $(docker ps --filter label=com.docker.compose.service=backend --format '{{.Label "com.docker.compose.project"}}' | sort -u); do
+      echo "== $(date -u +%FT%TZ) $p"
+      compose_of "$p" exec -T backend bench --site all backup --with-files || rc=1
+    done
+    exit "$rc" ;;
+  ps) docker ps --format 'table {{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.Status}}\t{{.Image}}' | sort ;;
+  *) usage ;;
+esac

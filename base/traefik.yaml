@@ -1,0 +1,44 @@
+# Shared reverse proxy for every bench. Keeps frappe_docker's names — network traefik-public,
+# entrypoints http/https, resolver "le", middleware https-redirect — so overrides/compose.multi-bench*.yaml
+# work unchanged. Differs from upstream compose.traefik(-ssl).yaml only by having no dashboard/API.
+services:
+  traefik:
+    image: traefik:v3.7
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.http.address=:80
+      - --entrypoints.http.http.underscoreHeadersStrategy=delete
+      - --entrypoints.https.address=:443
+      - --entrypoints.https.http.underscoreHeadersStrategy=delete
+      - --certificatesresolvers.le.acme.email=${EMAIL:?No EMAIL set}
+      - --certificatesresolvers.le.acme.storage=/certificates/acme.json
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --accesslog
+      - --log
+    labels:
+      # Middleware the bench routers reference; defined here as upstream does.
+      - traefik.enable=true
+      - traefik.docker.network=traefik-public
+      - traefik.http.middlewares.https-redirect.redirectscheme.scheme=https
+      - traefik.http.middlewares.https-redirect.redirectscheme.permanent=true
+      # An explicit never-matching router, so Traefik doesn't invent a default one for this container.
+      - traefik.http.routers.traefik-noop.rule=Host(`traefik.invalid`)
+      - traefik.http.routers.traefik-noop.service=noop@internal
+      - traefik.http.services.traefik-noop.loadbalancer.server.port=80
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - cert-data:/certificates
+    networks:
+      - traefik-public
+
+networks:
+  traefik-public:
+    name: traefik-public
+
+volumes:
+  cert-data:

@@ -1,0 +1,3 @@
+# Sized for one 8 GiB host shared by several benches. Revisit with `docker stats` under real load.
+[mysqld]
+innodb_buffer_pool_size = 1G
