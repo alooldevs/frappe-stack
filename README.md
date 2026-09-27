@@ -48,8 +48,6 @@ git clone https://github.com/alooldevs/frappe-stack.git ~/stack
 sudo bash ~/stack/bootstrap/host-prep.sh     # Docker, 4G swap, sysctl, SSH keys-only
 sudo reboot                                  # if it says REBOOT NEEDED; otherwise log out and in
 ```
-The kit repo is private? Clone it through a step 4 alias instead:
-`git clone git@github-ACCOUNT:alooldevs/frappe-stack.git ~/stack`
 
 **6. Shared services** (2 min)
 ```sh
@@ -104,6 +102,7 @@ The build receives only the SSH keys that bench uses, as a secret. They are gone
 | Any bench command | `stack bench alpha --site erp.example.org migrate` |
 | Shell in a bench | `stack sh alpha` |
 | Logs | `stack logs alpha backend` · `stack logs traefik` |
+| Restart a bench | `stack restart alpha` (or one service: `stack restart alpha backend`) |
 | Update apps (new commits) | `stack build alpha && stack up alpha && stack bench alpha --site all migrate` |
 | Add a site | point DNS, then `stack site alpha new.example.org app_one` |
 | Add a bench | `stack new-bench beta x.example.org` → edit → `stack build beta && stack up beta && stack site beta x.example.org …` |
