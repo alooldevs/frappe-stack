@@ -70,6 +70,35 @@ A bench with a different Python: `NATIVE_PYTHON=3.12 native new-bench old …` (
 - **One Redis per bench,** started by supervisor from bench's own config. The system `redis-server`
   service is off.
 
+## Moving a Docker server to native
+
+Done on ugenesis (2026-09-27, about 25 min of downtime). The Docker data stays until you remove it,
+so you can roll back.
+```sh
+# 1. back up each site and copy the backup out of the bench's volume
+stack bench alpha --site erp.example.org backup --with-files
+docker compose -p alpha -f ~/stack/compose/alpha.yaml cp backend:/home/frappe/frappe-bench/sites/erp.example.org/private/backups ~/migration
+# 2. stop Docker (volumes kept), drop its backup cron, free the mode
+stack down alpha && stack down traefik && stack down mariadb
+crontab -l | grep -vF "bin/stack backup" | crontab -
+sudo mv /etc/frappe-stack-mode /etc/frappe-stack-mode.docker-was-here
+# 3. native engine, bench, site (a fresh site first: it gets the certificate and nginx)
+sudo bash ~/stack/bootstrap/host-prep.sh native
+native init you@example.org
+native new-bench alpha <frappe-url> <branch> && native bench alpha get-app <app-url> --branch <b>
+native site alpha erp.example.org <app> …
+# 4. restore the Docker backup into it
+native bench alpha --site erp.example.org restore ~/migration/<stamp>-database.sql.gz \
+  --with-public-files ~/migration/<stamp>-files.tar --with-private-files ~/migration/<stamp>-private-files.tar \
+  --db-root-username stack_admin --db-root-password "$(sed -n s/^DB_ADMIN_PASSWORD=//p ~/stack/env/native.env)" --force
+native bench alpha --site erp.example.org migrate && native site alpha erp.example.org
+```
+If the old site's `site_config.json` has an `encryption_key`, copy it over
+(`native bench alpha --site … set-config encryption_key …`), or saved passwords can't be decrypted.
+Frappe only creates the key the first time something encrypted is saved.
+Roll back: `sudo mv /etc/frappe-stack-mode.docker-was-here /etc/frappe-stack-mode && stack init you@example.org && stack up alpha`
+(stop nginx first if native already took port 80).
+
 ## Files
 
 | Path | What |
